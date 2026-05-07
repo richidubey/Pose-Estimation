@@ -1,0 +1,17 @@
+
+conda create -n poseEst python=3.10
+conda activate poseEst
+
+# add conda-forge (once)
+conda config --add channels conda-forge
+conda config --set channel_priority strict
+
+# install packages
+conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
+conda install numpy opencv matplotlib scikit-learn scipy pandas -c conda-forge
+
+# Install Meta's Segment Anything Model (SAM)
+pip install git+https://github.com/facebookresearch/segment-anything.git
+
+# Download the default SAM weights to your 'datasets' folder
+wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth

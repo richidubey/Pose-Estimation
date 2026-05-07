@@ -1,0 +1,6 @@
+*.pth
+*.pt
+large_100_v1/
+results/
+results_yolo_poses/
+__pycache__/
