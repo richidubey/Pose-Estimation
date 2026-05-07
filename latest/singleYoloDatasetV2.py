@@ -9,8 +9,8 @@ import itertools
 from scipy.spatial.transform import Rotation as R
 from sklearn.linear_model import RANSACRegressor
 
-# Import Meta SAM
-from segment_anything import sam_model_registry, SamPredictor
+# Import YOLO instead of SAM
+from ultralytics import YOLO
 
 
 # 1. SETUP & CONFIGURATION
@@ -28,7 +28,7 @@ INTRINSICS_PATH = os.path.join(BASE_DIR, "camera_intrinsics.json")
 FORKLIFT_VIEWS_PATH = os.path.join(BASE_DIR, "forklift_views.csv")
 OBB_PATH = os.path.join(BASE_DIR, "rigid_body_obbs.csv")
 
-SAM_WEIGHTS = "sam_vit_h_4b8939.pth"
+YOLO_WEIGHTS = "/nethome/rdubey36/poseEst/large_100_v1/best.pt"
 RESULTS_DIR = "results"
 
 
@@ -87,14 +87,14 @@ def draw_pose_axes(img, x, y, z, yaw, T_world2cam, intrinsics, length=0.4, thick
     pts_3d = np.array([origin, pt_x, pt_y, pt_z])
     pixels = project_3d_to_pixel(pts_3d, T_world2cam, fx, fy, cx, cy)
     if len(pixels) == 4:
-        p_org, p_x, p_y, p_z = [tuple(p.astype(int)) for p in pixels]
+        p_org, p_x, p_y, p_z =[tuple(p.astype(int)) for p in pixels]
         cv2.arrowedLine(img, p_org, p_x, (0, 0, 255), thickness, tipLength=0.2)
         cv2.arrowedLine(img, p_org, p_y, (0, 255, 0), thickness, tipLength=0.2)
         cv2.arrowedLine(img, p_org, p_z, (255, 0, 0), thickness, tipLength=0.2)
 
 def calculate_adds(gt_cx, gt_cy, gt_yaw, est_cx, est_cy, est_yaw, hx, hy, hz=0.075):
     """Calculates ADD-S (Average Distance of Symmetric points) for 6D pose evaluation."""
-    base_corners = np.array(list(itertools.product([hx, -hx], [hy, -hy], [hz, -hz])))
+    base_corners = np.array(list(itertools.product([hx, -hx], [hy, -hy],[hz, -hz])))
     
     def transform(corners, center_x, center_y, yaw):
         c, s = np.cos(yaw), np.sin(yaw)
@@ -115,9 +115,8 @@ def calculate_adds(gt_cx, gt_cy, gt_yaw, est_cx, est_cy, est_yaw, hx, hy, hz=0.0
 # 3. MAIN PIPELINE
 
 def main():
-    print("Initializing SAM Model...")
-    sam = sam_model_registry["vit_h"](checkpoint=SAM_WEIGHTS)
-    predictor = SamPredictor(sam)
+    print("Initializing YOLO Model...")
+    model = YOLO(YOLO_WEIGHTS)
     
     with open(INTRINSICS_PATH, 'r') as f:
         intrinsics_data = json.load(f)
@@ -160,7 +159,9 @@ def main():
         T_world2cam = np.linalg.inv(T_cam2world)
         cam_world_pos = T_cam2world[:3, 3]
 
-        predictor.set_image(img_rgb)
+        # RUN YOLO INFERENCE ONCE PER IMAGE
+        results = model(img_rgb, verbose=False)
+        result = results[0]
         
         img_dir = os.path.join(RESULTS_DIR, img_id)
         os.makedirs(img_dir, exist_ok=True)
@@ -195,14 +196,41 @@ def main():
             if not (0 <= px < img_w and 0 <= py < img_h):
                 continue 
 
+            # --- YOLO DETECTION MATCHING ---
+            # Match the GT front center (px, py) to the closest YOLO detection
+            matched_idx = -1
+            best_dist = 200  # Threshold in pixels to match a YOLO box to the GT pallet
+            if len(result.boxes) > 0:
+                boxes = result.boxes.xyxy.cpu().numpy()
+                for i_box, box in enumerate(boxes):
+                    x1, y1, x2, y2 = box
+                    box_cx, box_cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                    dist = np.hypot(px - box_cx, py - box_cy)
+                    if dist < best_dist:
+                        best_dist = dist
+                        matched_idx = i_box
+
+            if matched_idx == -1:
+                # If YOLO completely missed this pallet in the scene
+                continue
+
             print(f"  -> Pallet {pallet_counter} in view (Dist: {dist_to_cam:.1f}m). Running pipeline...")
             pallet_dir = os.path.join(img_dir, str(pallet_counter))
             os.makedirs(pallet_dir, exist_ok=True)
 
-            # --- STEP 1: SEGMENTATION ---
+            # --- STEP 1: SEGMENTATION / EXTRACTION ---
             point_coords = np.array([[px, py]])
-            masks, _, _ = predictor.predict(point_coords=point_coords, point_labels=np.array([1]), multimask_output=False)
-            mask = masks[0]
+            
+            # Retrieve the mask of the matched detection 
+            # (Supports both Segmentation and Object Detection YOLO variants)
+            mask = np.zeros((img_h, img_w), dtype=bool)
+            if result.masks is not None:
+                yolo_mask = result.masks.data[matched_idx].cpu().numpy()
+                yolo_mask = cv2.resize(yolo_mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+                mask = yolo_mask > 0.5
+            else:
+                x1, y1, x2, y2 = result.boxes.xyxy[matched_idx].cpu().numpy().astype(int)
+                mask[y1:y2, x1:x2] = True
 
             vis_step1 = img.copy()
             vis_step1[mask] = [255, 0, 0] 
@@ -333,7 +361,7 @@ def main():
                 f"Front Center Y Error: {err_y*100:.2f} cm",
                 f"Yaw Error: {err_yaw_deg:.2f} deg"
             ]
-            for i, line in enumerate(text_block_4 + ["", "GREEN Dot: GT | RED Dot: RANSAC"]):
+            for i, line in enumerate(text_block_4 +["", "GREEN Dot: GT | RED Dot: RANSAC"]):
                 cv2.putText(vis_img_4, line, (20, 40 + i*35), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             cv2.imwrite(os.path.join(pallet_dir, "04_front_center_benchmark.png"), vis_img_4)
 

@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../flash/datasets/ForkliftScene3Dv3"
+		},
+		{
+			"path": "../flash/datasets/ForkliftScene3Dv2"
 		}
 	],
 	"settings": {}
