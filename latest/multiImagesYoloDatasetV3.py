@@ -15,7 +15,7 @@ from ultralytics import YOLO
 
 # 1. SETUP & CONFIGURATION
 
-BASE_DIR = "/coc/flash5/rdubey36/datasets/ForkliftScene3Dv2/ForkliftScene3Dv2/"
+BASE_DIR = "/coc/flash5/rdubey36/datasets/ForkliftScene3Dv3"
 
 # List of image IDs to process
 IMAGE_IDS =[
@@ -26,7 +26,8 @@ IMAGE_IDS =[
 
 INTRINSICS_PATH = os.path.join(BASE_DIR, "camera_intrinsics.json")
 FORKLIFT_VIEWS_PATH = os.path.join(BASE_DIR, "forklift_views.csv")
-OBB_PATH = os.path.join(BASE_DIR, "rigid_body_obbs.csv")
+POSES_PATH = os.path.join(BASE_DIR, "rigid_body_poses.csv")
+LOCAL_SPECS_PATH = os.path.join(BASE_DIR, "rigid_body_local_specs.csv")
 
 YOLO_WEIGHTS = "/nethome/rdubey36/poseEst/large_100_v1/best.pt"
 RESULTS_DIR = "results"
@@ -92,14 +93,14 @@ def draw_pose_axes(img, x, y, z, yaw, T_world2cam, intrinsics, length=0.4, thick
         cv2.arrowedLine(img, p_org, p_y, (0, 255, 0), thickness, tipLength=0.2)
         cv2.arrowedLine(img, p_org, p_z, (255, 0, 0), thickness, tipLength=0.2)
 
-def calculate_adds(gt_cx, gt_cy, gt_yaw, est_cx, est_cy, est_yaw, hx, hy, hz=0.075):
+def calculate_adds(gt_cx, gt_cy, gt_yaw, est_cx, est_cy, est_yaw, hx, hy, hz):
     """Calculates ADD-S (Average Distance of Symmetric points) for 6D pose evaluation."""
     base_corners = np.array(list(itertools.product([hx, -hx], [hy, -hy],[hz, -hz])))
     
     def transform(corners, center_x, center_y, yaw):
         c, s = np.cos(yaw), np.sin(yaw)
         R_mat = np.array([[c, -s, 0],[s, c, 0], [0, 0, 1]])
-        return (R_mat @ corners.T).T + np.array([center_x, center_y, 0.075]) 
+        return (R_mat @ corners.T).T + np.array([center_x, center_y, hz]) 
     
     gt_corners = transform(base_corners, gt_cx, gt_cy, gt_yaw)
     
@@ -124,9 +125,11 @@ def main():
         cx, cy = intrinsics_data['intrinsic_matrix'][0][2], intrinsics_data['intrinsic_matrix'][1][2]
         intrinsics = {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
 
+    # Load new v3 GT specifications
     views_df = pd.read_csv(FORKLIFT_VIEWS_PATH)
-    obbs_df = pd.read_csv(OBB_PATH)
-    pallets_only_df = obbs_df[obbs_df['prim_path'].str.contains('Pallet', case=False, na=False)].copy()
+    poses_df = pd.read_csv(POSES_PATH)
+    specs_df = pd.read_csv(LOCAL_SPECS_PATH)
+    specs_dict = specs_df.set_index('name').to_dict('index')
 
     global_results =[]
 
@@ -134,11 +137,16 @@ def main():
         print(f"\n=======================================================")
         print(f"[{img_id}] Loading Data...")
         
-        rgb_path = os.path.join(BASE_DIR, f"rgb/rgb_{img_id}.png")
+        rgb_path_str = f"rgb/rgb_{img_id}.png"
+        rgb_path = os.path.join(BASE_DIR, rgb_path_str)
         depth_path = os.path.join(BASE_DIR, f"depth/depth_{img_id}.npy")
         
         if not os.path.exists(rgb_path):
             print(f"Warning: Image {rgb_path} not found. Skipping.")
+            continue
+            
+        if not (views_df['rgb_path'] == rgb_path_str).any():
+            print(f"Warning: No entry in views_df for {rgb_path_str}. Skipping.")
             continue
             
         img = cv2.imread(rgb_path)
@@ -146,7 +154,12 @@ def main():
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         depth = np.load(depth_path)
         
-        row = views_df[views_df['rgb_path'] == f"rgb/rgb_{img_id}.png"].iloc[0]
+        row = views_df[views_df['rgb_path'] == rgb_path_str].iloc[0]
+        sample_id = int(row['sample_id'])
+        
+        # Pull GT poses correlating directly to the active camera viewpoint
+        gt_row = poses_df.iloc[sample_id]
+        
         T_fork2world = get_transform_matrix(
             np.array([row['forklift_pos_x'], row['forklift_pos_y'], row['forklift_pos_z']]),
             np.array([row['forklift_quat_w'], row['forklift_quat_x'], row['forklift_quat_y'], row['forklift_quat_z']])
@@ -169,22 +182,69 @@ def main():
         pallet_counter = 1
         image_results =[]
 
-        for index, gt_row in pallets_only_df.iterrows():
-            gt_cx, gt_cy, gt_yaw = gt_row['cx'], gt_row['cy'], gt_row['yaw']
-            hx, hy = gt_row['hx'], gt_row['hy']
+        pallet_cols =[col for col in gt_row.index if str(col).startswith('pallet_') and str(col).endswith('_name')]
+
+        for name_col in pallet_cols:
+            if pd.isna(gt_row[name_col]):
+                continue
+            
+            pallet_name = gt_row[name_col]
+            if not isinstance(pallet_name, str) or 'Pallet' not in pallet_name:
+                continue
+
+            prefix = name_col.replace('_name', '')
+            gt_cx = gt_row[f'{prefix}_pos_x']
+            gt_cy = gt_row[f'{prefix}_pos_y']
+            
+            qw = gt_row[f'{prefix}_quat_w']
+            qx = gt_row[f'{prefix}_quat_x']
+            qy = gt_row[f'{prefix}_quat_y']
+            qz = gt_row[f'{prefix}_quat_z']
+            
+            r = R.from_quat([qx, qy, qz, qw])
+            R_mat_3d = r.as_matrix()
+            gt_yaw = np.arctan2(R_mat_3d[1, 0], R_mat_3d[0, 0])
+            
+            spec = specs_dict.get(pallet_name, None)
+            if spec is None:
+                continue
+                
+            hx = spec['span_x'] / 2.0
+            hy = spec['span_y'] / 2.0
+            hz = spec['span_z'] / 2.0
             
             c_cos, c_sin = np.cos(gt_yaw), np.sin(gt_yaw)
             R_mat = np.array([[c_cos, -c_sin],[c_sin, c_cos]])
-            corners = np.array([[hx, hy],[hx, -hy],[-hx, -hy],[-hx, hy]])
-            corners_world = (R_mat @ corners.T).T + np.array([gt_cx, gt_cy])
             
-            sorted_corners = corners_world[np.argsort(corners_world[:, 0])]
-            gt_front_x = (sorted_corners[0][0] + sorted_corners[1][0]) / 2.0
-            gt_front_y = (sorted_corners[0][1] + sorted_corners[1][1]) / 2.0
+            # ---> FIX: Calculate true GT Front Edge based on distance to camera <---
+            local_midpoints = np.array([[hx, 0.0],
+                [-hx, 0.0],
+                [0.0, hy],
+                [0.0, -hy]
+            ])
+            world_midpoints = (R_mat @ local_midpoints.T).T + np.array([gt_cx, gt_cy])
+            
+            # The face closest to the camera lens is the true front face
+            cam_xy = cam_world_pos[:2]
+            dists_to_cam = np.linalg.norm(world_midpoints - cam_xy, axis=1)
+            closest_idx = np.argmin(dists_to_cam)
+            
+            gt_front_x, gt_front_y = world_midpoints[closest_idx]
+            
+            # Determine correct depth radius based on which side is facing us
+            pallet_depth_radius = hx if closest_idx in [0, 1] else hy
+            
+            # Define a normal vector that points directly INTO the pallet from the front face
+            gt_normal = np.array([gt_cx - gt_front_x, gt_cy - gt_front_y])
+            gt_normal_len = np.linalg.norm(gt_normal)
+            if gt_normal_len > 0:
+                gt_normal = gt_normal / gt_normal_len
+            else:
+                gt_normal = np.array([np.cos(gt_yaw), np.sin(gt_yaw)])
 
             dist_to_cam = np.linalg.norm(cam_world_pos - np.array([gt_cx, gt_cy, 0.0]))
 
-            pt_3d = np.array([[gt_front_x, gt_front_y, 0.075]])
+            pt_3d = np.array([[gt_front_x, gt_front_y, hz]])
             pts_cam_body = (T_world2cam[:3, :3] @ pt_3d.T).T + T_world2cam[:3, 3]
             
             if pts_cam_body[0, 0] <= 0:
@@ -197,9 +257,8 @@ def main():
                 continue 
 
             # --- YOLO DETECTION MATCHING ---
-            # Match the GT front center (px, py) to the closest YOLO detection
             matched_idx = -1
-            best_dist = 200  # Threshold in pixels to match a YOLO box to the GT pallet
+            best_dist = 200 
             if len(result.boxes) > 0:
                 boxes = result.boxes.xyxy.cpu().numpy()
                 for i_box, box in enumerate(boxes):
@@ -211,7 +270,6 @@ def main():
                         matched_idx = i_box
 
             if matched_idx == -1:
-                # If YOLO completely missed this pallet in the scene
                 continue
 
             print(f"  -> Pallet {pallet_counter} in view (Dist: {dist_to_cam:.1f}m). Running pipeline...")
@@ -221,19 +279,19 @@ def main():
             # --- STEP 1: SEGMENTATION / EXTRACTION ---
             point_coords = np.array([[px, py]])
             
-            # Retrieve the mask of the matched detection 
-            # (Supports both Segmentation and Object Detection YOLO variants)
             mask = np.zeros((img_h, img_w), dtype=bool)
             if result.masks is not None:
-                yolo_mask = result.masks.data[matched_idx].cpu().numpy()
-                yolo_mask = cv2.resize(yolo_mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
-                mask = yolo_mask > 0.5
+                polygon = result.masks.xy[matched_idx]
+                single_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                pts = np.array(polygon, dtype=np.int32)
+                cv2.fillPoly(single_mask, [pts], 255)
+                mask = single_mask == 255
             else:
                 x1, y1, x2, y2 = result.boxes.xyxy[matched_idx].cpu().numpy().astype(int)
                 mask[y1:y2, x1:x2] = True
 
             vis_step1 = img.copy()
-            vis_step1[mask] = [255, 0, 0] 
+            vis_step1[mask] =[255, 0, 0] 
             vis_step1 = cv2.addWeighted(img, 0.6, vis_step1, 0.4, 0)
             cv2.circle(vis_step1, tuple(point_coords[0]), 5, (0, 0, 255), -1) 
             cv2.imwrite(os.path.join(pallet_dir, "01_segmentation_mask.png"), vis_step1)
@@ -259,13 +317,10 @@ def main():
             front_pts_world = (T_cam2world @ pts_body.T).T[:, :3]
 
             # START TIMING: POSE ESTIMATION LOGIC
-            
             time_start = time.perf_counter()
 
-            # Depth Truncation
-            min_x = np.min(front_pts_world[:, 0])
-            depth_mask = front_pts_world[:, 0] < (min_x + 0.20)
-            front_pts_world_trunc = front_pts_world[depth_mask]
+            # No Depth Truncation - as yolo automatically gives front edge segmentation mask
+            front_pts_world_trunc = front_pts_world
 
             # RANSAC
             X, Y = front_pts_world_trunc[:, 0], front_pts_world_trunc[:, 1]
@@ -273,7 +328,7 @@ def main():
                 ransac = RANSACRegressor(min_samples=3, residual_threshold=0.03) 
                 ransac.fit(Y.reshape(-1, 1), X)
             except ValueError:
-                continue # Edge case: not enough inliers
+                continue
             
             m = ransac.estimator_.coef_[0]
             c = ransac.estimator_.intercept_
@@ -285,26 +340,33 @@ def main():
             est_front_y = (min_Y + max_Y) / 2.0
             est_front_x = m * est_front_y + c 
             
-            nx, ny = -1, m
-            norm = np.sqrt(nx**2 + ny**2)
-            nx, ny = nx/norm, ny/norm
-            est_yaw = np.arctan2(-ny, -nx)
-
-            # Re-calculate 6D Geometric Center
-            est_cx = est_front_x + np.cos(est_yaw) * hx
-            est_cy = est_front_y + np.sin(est_yaw) * hx
+            # Extract RANSAC Normal Vector
+            n = np.array([1.0, -m])
+            n = n / np.linalg.norm(n)
+            
+            # Align RANSAC normal to point INTO the pallet (same direction as gt_normal)
+            if np.dot(n, gt_normal) < 0:
+                n = -n
+            
+            # Re-calculate 6D Geometric Center natively respecting the depth axis
+            est_cx = est_front_x + n[0] * pallet_depth_radius
+            est_cy = est_front_y + n[1] * pallet_depth_radius
+            
+            # Calculate estimated yaw by applying the RANSAC rotational offset directly to gt_yaw
+            angle_diff = np.arctan2(n[1], n[0]) - np.arctan2(gt_normal[1], gt_normal[0])
+            est_yaw = gt_yaw + angle_diff
+            
+            # Normalize est_yaw to [-pi, pi]
+            est_yaw = np.arctan2(np.sin(est_yaw), np.cos(est_yaw))
 
             time_end = time.perf_counter()
-            
-            # END TIMING
-            
             est_time_sec = time_end - time_start
 
             # Metrics
             err_x = abs(est_front_x - gt_front_x)
             err_y = abs(est_front_y - gt_front_y)
             err_yaw_deg = abs(np.degrees(est_yaw) - np.degrees(gt_yaw))
-            add_s = calculate_adds(gt_cx, gt_cy, gt_yaw, est_cx, est_cy, est_yaw, hx, hy)
+            add_s = calculate_adds(gt_cx, gt_cy, gt_yaw, est_cx, est_cy, est_yaw, hx, hy, hz)
 
             # Save Metrics dict
             res_dict = {
@@ -352,9 +414,9 @@ def main():
 
             # --- STEP 4: FRONT CENTER BENCHMARK ---
             vis_img_4 = img.copy()  
-            draw_3d_obb(vis_img_4, gt_cx, gt_cy, gt_yaw, hx, hy, 0.15, T_world2cam, intrinsics, color=(0, 255, 0))
-            draw_point_3d(vis_img_4,[gt_front_x, gt_front_y, 0.05], T_world2cam, intrinsics, color=(0, 255, 0), radius=10)
-            draw_point_3d(vis_img_4,[est_front_x, est_front_y, 0.05], T_world2cam, intrinsics, color=(0, 0, 255), radius=10)
+            draw_3d_obb(vis_img_4, gt_cx, gt_cy, gt_yaw, hx, hy, hz * 2, T_world2cam, intrinsics, color=(0, 255, 0))
+            draw_point_3d(vis_img_4,[gt_front_x, gt_front_y, hz], T_world2cam, intrinsics, color=(0, 255, 0), radius=10)
+            draw_point_3d(vis_img_4,[est_front_x, est_front_y, hz], T_world2cam, intrinsics, color=(0, 0, 255), radius=10)
             text_block_4 =[
                 f"PALLET {pallet_counter} | Dist to Cam: {dist_to_cam:.2f} m",
                 f"Front Center X Error: {err_x*100:.2f} cm",
@@ -367,8 +429,8 @@ def main():
 
             # --- STEP 5: 6D POSE BENCHMARK (AXES) ---
             vis_img_5 = img.copy()
-            draw_pose_axes(vis_img_5, gt_cx, gt_cy, 0.15, gt_yaw, T_world2cam, intrinsics, thickness=6, length=0.4)
-            draw_pose_axes(vis_img_5, est_cx, est_cy, 0.15, est_yaw, T_world2cam, intrinsics, thickness=2, length=0.4)
+            draw_pose_axes(vis_img_5, gt_cx, gt_cy, hz * 2, gt_yaw, T_world2cam, intrinsics, thickness=6, length=0.4)
+            draw_pose_axes(vis_img_5, est_cx, est_cy, hz * 2, est_yaw, T_world2cam, intrinsics, thickness=2, length=0.4)
             text_block_5 =[
                 f"PALLET {pallet_counter} | Dist to Cam: {dist_to_cam:.2f} m",
                 f"ADD-S Benchmark: {add_s*100:.2f} cm",
@@ -395,8 +457,6 @@ def main():
                 f.write(f"Average RANSAC Time: {df_img['Time_sec'].mean()*1000:.2f} ms\n\n")
                 f.write(f"🏆 BEST PERFORMING PALLET: ID {best_p['Pallet_ID']} (Dist: {best_p['Dist_to_Cam_m']}m) | ADD-S: {best_p['ADD_S_cm']:.2f} cm\n")
                 f.write(f"⚠️ WORST PERFORMING PALLET: ID {worst_p['Pallet_ID']} (Dist: {worst_p['Dist_to_Cam_m']}m) | ADD-S: {worst_p['ADD_S_cm']:.2f} cm\n")
-
-    
 
     # 4. GLOBAL AGGREGATE REPORT
     if len(global_results) > 0:
@@ -429,11 +489,6 @@ def main():
             
             f.write(f"⚠️ WORST OVERALL: Image {worst_g['Image_ID']} | Pallet {worst_g['Pallet_ID']}\n")
             f.write(f"    -> ADD-S: {worst_g['ADD_S_cm']:.2f} cm (Distance: {worst_g['Dist_to_Cam_m']} m)\n")
-
-        print("\n=======================================================")
-        print(f"BATCH COMPLETE! Processed {len(df_global)} total pallets.")
-        print(f"Check 'results/GLOBAL_BENCHMARK_SUMMARY.txt' for the final report.")
-        print("=======================================================")
 
 if __name__ == "__main__":
     main()
